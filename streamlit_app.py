@@ -7,8 +7,8 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-st.set_page_config(page_title="Avito Master Tool Final", layout="wide")
-st.title("Avito Master Tool Final")
+st.set_page_config(page_title="Avito Master Tool Final + Preview", layout="wide")
+st.title("Avito Master Tool Final + Preview")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -26,7 +26,6 @@ stock_file = st.file_uploader("3) Файл остатков", type=["xlsx"])
 
 ARTICLE_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-]{3,}\b")
 
-# Всё это считаем неоригиналом и исключаем из прайса
 NON_ORIGINAL_MARKERS = [
     "compatible",
     "совместим",
@@ -65,7 +64,6 @@ NON_ORIGINAL_MARKERS = [
     "easy print",
 ]
 
-# В объявлении тоже не трогаем такие строки
 NON_ORIGINAL_AVITO_MARKERS = NON_ORIGINAL_MARKERS.copy()
 
 
@@ -146,7 +144,6 @@ def is_non_original_price_row(row_text: str, manufacturer: str) -> bool:
 
     if contains_non_original_marker(txt, NON_ORIGINAL_MARKERS):
         return True
-
     if contains_non_original_marker(mfr, NON_ORIGINAL_MARKERS):
         return True
 
@@ -316,6 +313,142 @@ def detect_sheet_columns(ws):
     return cols
 
 
+def preview_changes(avito_file_obj, price_map, stock_map, margin_percent, offset_hours, active_days, close_days_back):
+    wb = load_workbook(avito_file_obj, data_only=True)
+
+    update_rows = []
+    skipped_non_original = []
+    new_stock_ids = []
+
+    for ws in wb.worksheets:
+        cols = detect_sheet_columns(ws)
+        title_col = cols["title_col"]
+        desc_col = cols["desc_col"]
+        price_col = cols["price_col"]
+        status_col = cols["status_col"]
+        ad_number_col = cols["ad_number_col"]
+
+        if not title_col:
+            continue
+
+        for row in range(5, ws.max_row + 1):
+            title = ws.cell(row=row, column=title_col).value if title_col else ""
+            desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
+            old_price = ws.cell(row=row, column=price_col).value if price_col else ""
+            status_text = ws.cell(row=row, column=status_col).value if status_col else ""
+            avito_id = clean(ws.cell(row=row, column=ad_number_col).value) if ad_number_col else ""
+
+            if clean(title) == "":
+                continue
+
+            if not is_original_avito_row(title, desc):
+                skipped_non_original.append({
+                    "sheet": ws.title,
+                    "row": row,
+                    "avito_id": avito_id,
+                    "title": clean(title),
+                })
+                continue
+
+            article = choose_article(title, desc, price_map)
+
+            if article:
+                qty = int(stock_map.get(article, 0))
+                new_price = round_up_100(price_map[article] * (1 + margin_percent / 100.0)) if article in price_map else old_price
+                new_dateend = calc_dateend_from_qty(qty, offset_hours, active_days, close_days_back)
+                action = "Закрыть" if qty <= 0 else "Оставить активным"
+            else:
+                qty = None
+                new_price = old_price
+                new_dateend = calc_dateend_from_status(status_text, offset_hours, active_days, close_days_back)
+                action = "DateEnd по статусу"
+
+            update_rows.append({
+                "sheet": ws.title,
+                "row": row,
+                "avito_id": avito_id,
+                "article": article or "",
+                "title": clean(title),
+                "old_price": old_price,
+                "new_price": new_price,
+                "qty": qty,
+                "new_dateend": new_dateend,
+                "action": action,
+            })
+
+    return pd.DataFrame(update_rows), pd.DataFrame(skipped_non_original)
+
+
+def build_avito_article_map(avito_file_obj, price_map):
+    wb = load_workbook(avito_file_obj, data_only=True)
+    ad_to_article = {}
+    matched = 0
+    unmatched = 0
+    skipped_non_original_avito = 0
+
+    for ws in wb.worksheets:
+        cols = detect_sheet_columns(ws)
+        title_col = cols["title_col"]
+        desc_col = cols["desc_col"]
+        ad_number_col = cols["ad_number_col"]
+
+        if not ad_number_col:
+            continue
+
+        for row in range(5, ws.max_row + 1):
+            ad_number = ws.cell(row=row, column=ad_number_col).value
+            if not ad_number:
+                continue
+
+            title = ws.cell(row=row, column=title_col).value if title_col else ""
+            desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
+
+            if not is_original_avito_row(title, desc):
+                skipped_non_original_avito += 1
+                continue
+
+            article = choose_article(title, desc, price_map)
+
+            if article:
+                ad_to_article[clean(ad_number)] = article
+                matched += 1
+            else:
+                unmatched += 1
+
+    return ad_to_article, {
+        "matched": matched,
+        "unmatched": unmatched,
+        "skipped_non_original_avito": skipped_non_original_avito,
+    }
+
+
+def preview_new_stock_ids(stock_file_obj, avito_file_obj, price_map):
+    ad_to_article, _ = build_avito_article_map(avito_file_obj, price_map)
+
+    wb = load_workbook(stock_file_obj, data_only=True)
+    ws = wb.active
+
+    headers = [clean(c.value) for c in ws[1]]
+    avito_id_col = find_col_index(headers, ["avitoid"])
+
+    existing_ids = set()
+    if avito_id_col:
+        for row in range(2, ws.max_row + 1):
+            avito_id = clean(ws.cell(row=row, column=avito_id_col).value)
+            if avito_id:
+                existing_ids.add(avito_id)
+
+    new_ids = []
+    for avito_id, article in ad_to_article.items():
+        if avito_id not in existing_ids:
+            new_ids.append({
+                "avito_id": avito_id,
+                "article": article,
+            })
+
+    return pd.DataFrame(new_ids)
+
+
 def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_percent, offset_hours, active_days, close_days_back):
     wb = load_workbook(avito_file_obj)
     updated_rows = 0
@@ -424,49 +557,6 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
     }
 
 
-def build_avito_article_map(avito_file_obj, price_map):
-    wb = load_workbook(avito_file_obj, data_only=True)
-    ad_to_article = {}
-    matched = 0
-    unmatched = 0
-    skipped_non_original_avito = 0
-
-    for ws in wb.worksheets:
-        cols = detect_sheet_columns(ws)
-        title_col = cols["title_col"]
-        desc_col = cols["desc_col"]
-        ad_number_col = cols["ad_number_col"]
-
-        if not ad_number_col:
-            continue
-
-        for row in range(5, ws.max_row + 1):
-            ad_number = ws.cell(row=row, column=ad_number_col).value
-            if not ad_number:
-                continue
-
-            title = ws.cell(row=row, column=title_col).value if title_col else ""
-            desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
-
-            if not is_original_avito_row(title, desc):
-                skipped_non_original_avito += 1
-                continue
-
-            article = choose_article(title, desc, price_map)
-
-            if article:
-                ad_to_article[clean(ad_number)] = article
-                matched += 1
-            else:
-                unmatched += 1
-
-    return ad_to_article, {
-        "matched": matched,
-        "unmatched": unmatched,
-        "skipped_non_original_avito": skipped_non_original_avito,
-    }
-
-
 def update_stock_only(stock_file_obj, avito_file_obj, price_map, stock_map):
     ad_to_article, ad_map_stats = build_avito_article_map(avito_file_obj, price_map)
 
@@ -520,7 +610,6 @@ def update_stock_only(stock_file_obj, avito_file_obj, price_map, stock_map):
         else:
             many_count += 1
 
-    # Автоматически добавляем новые ID, которых ещё нет в stock файле
     next_row = ws.max_row + 1
     for avito_id, article in ad_to_article.items():
         if avito_id in existing_ids:
@@ -556,12 +645,13 @@ def update_stock_only(stock_file_obj, avito_file_obj, price_map, stock_map):
     }
 
 
-col_a, col_b, col_c = st.columns(3)
-run_prices = col_a.button("Обновить цены + DateEnd", use_container_width=True)
-run_stock = col_b.button("Обновить только Stock", use_container_width=True)
-run_all = col_c.button("Обновить всё", use_container_width=True)
+col_a, col_b, col_c, col_d = st.columns(4)
+run_preview = col_a.button("Предпросмотр", use_container_width=True)
+run_prices = col_b.button("Обновить цены + DateEnd", use_container_width=True)
+run_stock = col_c.button("Обновить только Stock", use_container_width=True)
+run_all = col_d.button("Обновить всё", use_container_width=True)
 
-if run_prices or run_stock or run_all:
+if run_preview or run_prices or run_stock or run_all:
     if not price_file or not avito_file:
         st.error("Для работы нужны минимум: прайс и файл Авито.")
         st.stop()
@@ -574,6 +664,46 @@ if run_prices or run_stock or run_all:
 
     st.write("### Диагностика прайса")
     st.write(price_diag)
+
+    if run_preview:
+        preview_df, skipped_df = preview_changes(
+            avito_file_obj=avito_file,
+            price_map=price_map,
+            stock_map=stock_map,
+            margin_percent=margin_percent,
+            offset_hours=utc_offset_hours,
+            active_days=active_days,
+            close_days_back=close_days_back,
+        )
+
+        st.write("### Что будет обновлено")
+        st.write({
+            "Всего строк к обработке": len(preview_df),
+            "Будут закрыты": int((preview_df["action"] == "Закрыть").sum()) if not preview_df.empty else 0,
+            "Будут активны": int((preview_df["action"] == "Оставить активным").sum()) if not preview_df.empty else 0,
+            "DateEnd по текущему статусу": int((preview_df["action"] == "DateEnd по статусу").sum()) if not preview_df.empty else 0,
+            "Пропущено как неоригинал": len(skipped_df),
+        })
+
+        if not preview_df.empty:
+            with st.expander("Таблица обновлений"):
+                st.dataframe(preview_df, use_container_width=True)
+
+        if not skipped_df.empty:
+            with st.expander("Пропущено как неоригинал"):
+                st.dataframe(skipped_df, use_container_width=True)
+
+        if stock_file:
+            new_ids_df = preview_new_stock_ids(
+                stock_file_obj=stock_file,
+                avito_file_obj=avito_file,
+                price_map=price_map,
+            )
+            st.write("### Новые ID, которые будут добавлены в stock")
+            st.write({"Новых AvitoId": len(new_ids_df)})
+            if not new_ids_df.empty:
+                with st.expander("Показать новые ID"):
+                    st.dataframe(new_ids_df, use_container_width=True)
 
     if run_prices or run_all:
         try:
