@@ -6,10 +6,9 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 
-st.set_page_config(page_title="Avito Master Tool vNext", layout="wide")
-st.title("Avito Master Tool vNext")
+st.set_page_config(page_title="Avito Master Tool Safe Mode", layout="wide")
+st.title("Avito Master Tool Safe Mode")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -27,7 +26,7 @@ stock_file = st.file_uploader("3) Файл остатков", type=["xlsx"])
 
 ARTICLE_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-]{3,}\b")
 
-# Неоригинал есть только в прайсе. На Avito его нет.
+# Неоригинал режем только в прайсе
 NON_ORIGINAL_MARKERS = [
     "compatible",
     "совместим",
@@ -35,7 +34,6 @@ NON_ORIGINAL_MARKERS = [
     "аналог",
     "noname",
     "no name",
-
     "g&g",
     "gg",
     "cet",
@@ -67,10 +65,6 @@ NON_ORIGINAL_MARKERS = [
     "superfine",
     "super fine",
 ]
-
-RED_FILL = PatternFill(fill_type="solid", start_color="FDE2E1", end_color="FDE2E1")
-GREEN_FILL = PatternFill(fill_type="solid", start_color="E2F6E9", end_color="E2F6E9")
-GRAY_FILL = PatternFill(fill_type="solid", start_color="ECECEC", end_color="ECECEC")
 
 
 def clean(x):
@@ -206,7 +200,6 @@ def load_price_map(file_obj):
         nomenclature = clean(row[nomenclature_col]) if nomenclature_col else ""
         full_row_text = " ".join(clean(v) for v in row.tolist())
 
-        # ВАЖНО: режем неоригинал только в прайсе
         if contains_non_original_marker(full_row_text) or contains_non_original_marker(manufacturer) or contains_non_original_marker(nomenclature):
             skipped_non_original += 1
             continue
@@ -238,15 +231,6 @@ def load_price_map(file_obj):
 def calc_dateend_from_qty(qty, offset_hours, active_days, close_days_back):
     now_dt = current_dt(offset_hours)
     if qty <= 0:
-        return fmt_dt(now_dt - timedelta(days=int(close_days_back)))
-    return fmt_dt(now_dt + timedelta(days=int(active_days)))
-
-
-def calc_dateend_from_status(status_text, offset_hours, active_days, close_days_back):
-    s = clean(status_text).lower()
-    now_dt = current_dt(offset_hours)
-
-    if "снято" in s or "неактив" in s or "архив" in s:
         return fmt_dt(now_dt - timedelta(days=int(close_days_back)))
     return fmt_dt(now_dt + timedelta(days=int(active_days)))
 
@@ -300,10 +284,9 @@ def detect_sheet_columns(ws):
     return cols
 
 
-def preview_changes(avito_file_obj, price_map, stock_map, margin_percent, offset_hours, active_days, close_days_back):
+def safe_mode_preview(avito_file_obj, price_map, stock_map, margin_percent, offset_hours, active_days, close_days_back):
     wb = load_workbook(avito_file_obj, data_only=True)
-
-    update_rows = []
+    preview_rows = []
 
     for ws in wb.worksheets:
         cols = detect_sheet_columns(ws)
@@ -320,7 +303,7 @@ def preview_changes(avito_file_obj, price_map, stock_map, margin_percent, offset
             title = ws.cell(row=row, column=title_col).value if title_col else ""
             desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
             old_price = ws.cell(row=row, column=price_col).value if price_col else ""
-            status_text = ws.cell(row=row, column=status_col).value if status_col else ""
+            old_status = ws.cell(row=row, column=status_col).value if status_col else ""
             avito_id = clean(ws.cell(row=row, column=ad_number_col).value) if ad_number_col else ""
 
             if clean(title) == "":
@@ -330,18 +313,20 @@ def preview_changes(avito_file_obj, price_map, stock_map, margin_percent, offset
 
             if article:
                 qty = int(stock_map.get(article, 0))
-                new_price = round_up_100(price_map[article] * (1 + margin_percent / 100.0)) if article in price_map else old_price
+                new_price = round_up_100(price_map[article] * (1 + margin_percent / 100.0))
                 new_dateend = calc_dateend_from_qty(qty, offset_hours, active_days, close_days_back)
-                action = "Закрыть" if qty <= 0 else "Оставить активным"
-                mode = "from_qty"
+                new_status = "Снято с публикации" if qty <= 0 else "Активно"
+                reason = "Найден в прайсе"
+                action = "Закрыть" if qty <= 0 else "Активировать"
             else:
-                qty = None
+                qty = 0
                 new_price = old_price
-                new_dateend = calc_dateend_from_status(status_text, offset_hours, active_days, close_days_back)
-                action = "DateEnd по статусу"
-                mode = "from_status"
+                new_dateend = calc_dateend_from_qty(0, offset_hours, active_days, close_days_back)
+                new_status = "Снято с публикации"
+                reason = "Не найден в прайсе"
+                action = "Закрыть"
 
-            update_rows.append({
+            preview_rows.append({
                 "sheet": ws.title,
                 "row": row,
                 "avito_id": avito_id,
@@ -349,13 +334,15 @@ def preview_changes(avito_file_obj, price_map, stock_map, margin_percent, offset
                 "title": clean(title),
                 "old_price": old_price,
                 "new_price": new_price,
+                "old_status": clean(old_status),
+                "new_status": new_status,
                 "qty": qty,
                 "new_dateend": new_dateend,
                 "action": action,
-                "mode": mode,
+                "reason": reason,
             })
 
-    return pd.DataFrame(update_rows)
+    return pd.DataFrame(preview_rows)
 
 
 def build_avito_article_map(avito_file_obj, price_map):
@@ -427,8 +414,7 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
     updated_rows = 0
     updated_prices = 0
     dateend_set_from_qty = 0
-    dateend_set_from_status = 0
-    unmatched = 0
+    dateend_set_from_missing = 0
     examples = []
 
     for ws in wb.worksheets:
@@ -445,7 +431,6 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
         for row in range(5, ws.max_row + 1):
             title = ws.cell(row=row, column=title_col).value if title_col else ""
             desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
-            status_text = ws.cell(row=row, column=status_col).value if status_col else ""
 
             if clean(title) == "":
                 continue
@@ -455,60 +440,39 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
             if article:
                 qty = int(stock_map.get(article, 0))
 
-                if article in price_map and price_col:
+                if price_col and article in price_map:
                     base_price = price_map[article]
                     new_price = round_up_100(base_price * (1 + margin_percent / 100.0))
                     ws.cell(row=row, column=price_col).value = new_price
                     updated_prices += 1
 
-                new_dateend = calc_dateend_from_qty(
-                    qty=qty,
-                    offset_hours=offset_hours,
-                    active_days=active_days,
-                    close_days_back=close_days_back,
-                )
+                new_dateend = calc_dateend_from_qty(qty, offset_hours, active_days, close_days_back)
                 ws.cell(row=row, column=dateend_col).value = new_dateend
-                dateend_set_from_qty += 1
-
                 if status_col:
-                    ws.cell(row=row, column=status_col).value = "Активно" if qty > 0 else "Снято с публикации"
-
-                updated_rows += 1
-
-                if len(examples) < 15:
-                    examples.append({
-                        "sheet": ws.title,
-                        "row": row,
-                        "article": article,
-                        "mode": "from_qty",
-                        "qty": qty,
-                        "dateend": new_dateend,
-                        "price": ws.cell(row=row, column=price_col).value if price_col else "",
-                    })
-
+                    ws.cell(row=row, column=status_col).value = "Снято с публикации" if qty <= 0 else "Активно"
+                dateend_set_from_qty += 1
+                mode = "from_qty"
             else:
-                unmatched += 1
+                new_dateend = calc_dateend_from_qty(0, offset_hours, active_days, close_days_back)
+                ws.cell(row=row, column=dateend_col).value = new_dateend
+                if status_col:
+                    ws.cell(row=row, column=status_col).value = "Снято с публикации"
+                dateend_set_from_missing += 1
+                qty = 0
+                mode = "missing_in_price"
 
-                fallback_dateend = calc_dateend_from_status(
-                    status_text=status_text,
-                    offset_hours=offset_hours,
-                    active_days=active_days,
-                    close_days_back=close_days_back,
-                )
-                ws.cell(row=row, column=dateend_col).value = fallback_dateend
-                dateend_set_from_status += 1
-                updated_rows += 1
+            updated_rows += 1
 
-                if len(examples) < 15:
-                    examples.append({
-                        "sheet": ws.title,
-                        "row": row,
-                        "article": "",
-                        "mode": "from_status",
-                        "status": clean(status_text),
-                        "dateend": fallback_dateend,
-                        "price": ws.cell(row=row, column=price_col).value if price_col else "",
-                    })
+            if len(examples) < 20:
+                examples.append({
+                    "sheet": ws.title,
+                    "row": row,
+                    "article": article or "",
+                    "mode": mode,
+                    "qty": qty,
+                    "dateend": new_dateend,
+                    "price": ws.cell(row=row, column=price_col).value if price_col else "",
+                })
 
     output = BytesIO()
     wb.save(output)
@@ -518,8 +482,7 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
         "updated_rows": updated_rows,
         "updated_prices": updated_prices,
         "dateend_set_from_qty": dateend_set_from_qty,
-        "dateend_set_from_status": dateend_set_from_status,
-        "unmatched": unmatched,
+        "dateend_set_from_missing": dateend_set_from_missing,
         "examples": examples,
     }
 
@@ -622,12 +585,12 @@ def color_action(val):
 
 
 col_a, col_b, col_c, col_d = st.columns(4)
-run_preview = col_a.button("Предпросмотр", use_container_width=True)
+run_safe = col_a.button("Safe-mode", use_container_width=True)
 run_prices = col_b.button("Обновить цены + DateEnd", use_container_width=True)
 run_stock = col_c.button("Обновить только Stock", use_container_width=True)
 run_all = col_d.button("Обновить всё", use_container_width=True)
 
-if run_preview or run_prices or run_stock or run_all:
+if run_safe or run_prices or run_stock or run_all:
     if not price_file or not avito_file:
         st.error("Для работы нужны минимум: прайс и файл Авито.")
         st.stop()
@@ -641,8 +604,8 @@ if run_preview or run_prices or run_stock or run_all:
     st.write("### Диагностика прайса")
     st.write(price_diag)
 
-    if run_preview:
-        preview_df = preview_changes(
+    if run_safe:
+        preview_df = safe_mode_preview(
             avito_file_obj=avito_file,
             price_map=price_map,
             stock_map=stock_map,
@@ -652,20 +615,19 @@ if run_preview or run_prices or run_stock or run_all:
             close_days_back=close_days_back,
         )
 
-        close_count = int((preview_df["action"] == "Закрыть").sum()) if not preview_df.empty else 0
-        active_count = int((preview_df["action"] == "Оставить активным").sum()) if not preview_df.empty else 0
-        fallback_count = int((preview_df["action"] == "DateEnd по статусу").sum()) if not preview_df.empty else 0
+        close_missing = int(((preview_df["action"] == "Закрыть") & (preview_df["reason"] == "Не найден в прайсе")).sum()) if not preview_df.empty else 0
+        close_zero = int(((preview_df["action"] == "Закрыть") & (preview_df["reason"] == "Найден в прайсе")).sum()) if not preview_df.empty else 0
+        active_count = int((preview_df["action"] == "Активировать").sum()) if not preview_df.empty else 0
 
-        st.write("### Что будет сделано")
+        st.write("### Safe-mode отчёт")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Будут закрыты", close_count)
-        c2.metric("Будут активны", active_count)
-        c3.metric("DateEnd по статусу", fallback_count)
+        c1.metric("Закрыть: нет в прайсе", close_missing)
+        c2.metric("Закрыть: qty=0", close_zero)
+        c3.metric("Активировать", active_count)
 
         if not preview_df.empty:
-            show_df = preview_df.copy()
             st.dataframe(
-                show_df.style.map(color_action, subset=["action"]),
+                preview_df.style.map(color_action, subset=["action"]),
                 use_container_width=True
             )
 
@@ -695,15 +657,14 @@ if run_preview or run_prices or run_stock or run_all:
             st.write({
                 "Цены обновлены": price_stats["updated_prices"],
                 "DateEnd по количеству": price_stats["dateend_set_from_qty"],
-                "DateEnd по текущему статусу": price_stats["dateend_set_from_status"],
-                "Не найдено в прайсе": price_stats["unmatched"],
+                "DateEnd по отсутствующим в прайсе": price_stats["dateend_set_from_missing"],
             })
             with st.expander("Показать примеры обновления"):
                 st.write(price_stats["examples"])
             st.download_button(
                 "Скачать файл цен + DateEnd",
                 data=price_output.getvalue(),
-                file_name="avito_prices_dateend_updated_vnext.xlsx",
+                file_name="avito_prices_dateend_safe.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         except Exception as e:
@@ -739,7 +700,7 @@ if run_preview or run_prices or run_stock or run_all:
                 st.download_button(
                     "Скачать файл остатков",
                     data=stock_output.getvalue(),
-                    file_name="avito_stock_only_updated_vnext.xlsx",
+                    file_name="avito_stock_only_safe.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             except Exception as e:
