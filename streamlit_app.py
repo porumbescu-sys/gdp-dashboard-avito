@@ -7,8 +7,8 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-st.set_page_config(page_title="Avito Master Tool Original Only", layout="wide")
-st.title("Avito Master Tool Original Only")
+st.set_page_config(page_title="Avito Master Tool Final", layout="wide")
+st.title("Avito Master Tool Final")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -26,26 +26,47 @@ stock_file = st.file_uploader("3) Файл остатков", type=["xlsx"])
 
 ARTICLE_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-]{3,}\b")
 
-# бренды/слова, которые считаем НЕоригиналом
+# Всё это считаем неоригиналом и исключаем из прайса
 NON_ORIGINAL_MARKERS = [
-    "superfine",
-    "cactus",
-    "nv-print",
-    "nv print",
-    "sakura",
+    "compatible",
+    "совместим",
+    "совместимый",
+    "аналог",
     "noname",
     "no name",
-    "совместим",
-    "аналог",
-    "compatible",
+
+    "g&g",
+    "gg",
+    "cet",
+    "cet group",
+    "aquamarine",
+    "cactus",
+    "sakura",
+    "dataproducts",
+    "retech",
+    "uniton",
+    "uniton premium",
+    "hi-black",
+    "hiblack",
+    "profiline",
+    "colortek",
+    "7q",
+    "nv print",
+    "nv-print",
+    "tonex",
+    "mse",
+    "freecolor",
+    "kodak",
+    "integral",
+    "static control",
+    "solnce",
+    "hyb toner",
+    "t2",
+    "easy print",
 ]
 
-# маркеры оригинала
-ORIGINAL_MARKERS = [
-    "оригинал",
-    "оригинальный",
-    "original",
-]
+# В объявлении тоже не трогаем такие строки
+NON_ORIGINAL_AVITO_MARKERS = NON_ORIGINAL_MARKERS.copy()
 
 
 def clean(x):
@@ -114,28 +135,27 @@ def candidate_tokens(text):
     return sorted(uniq, key=lambda s: (-len(s), s))
 
 
-def text_has_non_original_markers(text: str) -> bool:
-    s = clean(text).lower()
-    return any(marker in s for marker in NON_ORIGINAL_MARKERS)
+def contains_non_original_marker(text: str, markers) -> bool:
+    s = clean(text).lower().replace("ё", "е")
+    return any(marker in s for marker in markers)
 
 
-def text_has_original_markers(text: str) -> bool:
-    s = clean(text).lower()
-    return any(marker in s for marker in ORIGINAL_MARKERS)
+def is_non_original_price_row(row_text: str, manufacturer: str) -> bool:
+    txt = clean(row_text).lower().replace("ё", "е")
+    mfr = clean(manufacturer).lower().replace("ё", "е")
+
+    if contains_non_original_marker(txt, NON_ORIGINAL_MARKERS):
+        return True
+
+    if contains_non_original_marker(mfr, NON_ORIGINAL_MARKERS):
+        return True
+
+    return False
 
 
 def is_original_avito_row(title: str, desc: str) -> bool:
-    full = f"{clean(title)} {clean(desc)}"
-    if text_has_non_original_markers(full):
-        return False
-    return text_has_original_markers(full)
-
-
-def is_original_price_row(row_text: str) -> bool:
-    s = clean(row_text).lower()
-    if text_has_non_original_markers(s):
-        return False
-    return text_has_original_markers(s)
+    full = f"{clean(title)} {clean(desc)}".lower().replace("ё", "е")
+    return not contains_non_original_marker(full, NON_ORIGINAL_AVITO_MARKERS)
 
 
 def choose_article(title, desc, price_map):
@@ -162,6 +182,8 @@ def load_price_map(file_obj):
     article_col = None
     price_col = None
     stock_col = None
+    manufacturer_col = None
+    nomenclature_col = None
 
     for c in df.columns:
         cl = c.lower()
@@ -171,6 +193,10 @@ def load_price_map(file_obj):
             price_col = c
         if stock_col is None and "свобод" in cl:
             stock_col = c
+        if manufacturer_col is None and "производитель" in cl:
+            manufacturer_col = c
+        if nomenclature_col is None and cl == "номенклатура":
+            nomenclature_col = c
 
     if price_col is None and len(df.columns) >= 6:
         price_col = df.columns[5]
@@ -181,17 +207,23 @@ def load_price_map(file_obj):
     price_map = {}
     stock_map = {}
     skipped_non_original = 0
+    skipped_empty_article = 0
 
     for _, row in df.iterrows():
         article_raw = clean(row[article_col])
         art = norm_article(article_raw)
         if not art:
+            skipped_empty_article += 1
             continue
 
+        manufacturer = clean(row[manufacturer_col]) if manufacturer_col else ""
+        nomenclature = clean(row[nomenclature_col]) if nomenclature_col else ""
         full_row_text = " ".join(clean(v) for v in row.tolist())
 
-        # берем только оригинал
-        if not is_original_price_row(full_row_text):
+        if is_non_original_price_row(
+            row_text=f"{full_row_text} {nomenclature}",
+            manufacturer=manufacturer
+        ):
             skipped_non_original += 1
             continue
 
@@ -210,9 +242,12 @@ def load_price_map(file_obj):
         "article_col": article_col,
         "price_col": price_col,
         "stock_col": stock_col,
+        "manufacturer_col": manufacturer_col,
+        "nomenclature_col": nomenclature_col,
         "rows": len(df),
         "original_positions_loaded": len(price_map),
         "skipped_non_original_rows": skipped_non_original,
+        "skipped_empty_article_rows": skipped_empty_article,
     }
 
 
@@ -229,7 +264,6 @@ def calc_dateend_from_status(status_text, offset_hours, active_days, close_days_
 
     if "снято" in s or "неактив" in s or "архив" in s:
         return fmt_dt(now_dt - timedelta(days=int(close_days_back)))
-
     return fmt_dt(now_dt + timedelta(days=int(active_days)))
 
 
@@ -311,14 +345,12 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
             if clean(title) == "":
                 continue
 
-            # НЕоригинал в файле Avito не трогаем
             if not is_original_avito_row(title, desc):
                 skipped_non_original_avito += 1
                 continue
 
             article = choose_article(title, desc, price_map)
 
-            # если нашли оригинал в прайсе
             if article:
                 qty = int(stock_map.get(article, 0))
 
@@ -353,7 +385,6 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
                         "price": ws.cell(row=row, column=price_col).value if price_col else "",
                     })
 
-            # если прайс не нашёлся — хотя бы DateEnd по текущему статусу
             else:
                 unmatched += 1
 
@@ -489,6 +520,7 @@ def update_stock_only(stock_file_obj, avito_file_obj, price_map, stock_map):
         else:
             many_count += 1
 
+    # Автоматически добавляем новые ID, которых ещё нет в stock файле
     next_row = ws.max_row + 1
     for avito_id, article in ad_to_article.items():
         if avito_id in existing_ids:
@@ -567,7 +599,7 @@ if run_prices or run_stock or run_all:
             st.download_button(
                 "Скачать файл цен + DateEnd",
                 data=price_output.getvalue(),
-                file_name="avito_prices_dateend_updated_v4.xlsx",
+                file_name="avito_prices_dateend_updated_final.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         except Exception as e:
@@ -587,7 +619,7 @@ if run_prices or run_stock or run_all:
 
                 st.success(
                     f"Остатки обновлены. Обновлено строк: {stock_stats['updated_existing']}, "
-                    f"добавлено новых: {stock_stats['added_new']}"
+                    f"добавлено новых ID: {stock_stats['added_new']}"
                 )
 
                 st.write("### Отчёт по остаткам")
@@ -604,7 +636,7 @@ if run_prices or run_stock or run_all:
                 st.download_button(
                     "Скачать файл остатков",
                     data=stock_output.getvalue(),
-                    file_name="avito_stock_only_updated_v4.xlsx",
+                    file_name="avito_stock_only_updated_final.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             except Exception as e:
