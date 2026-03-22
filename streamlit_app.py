@@ -7,8 +7,8 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-st.set_page_config(page_title="Avito Master Tool DateEnd v3", layout="wide")
-st.title("Avito Master Tool DateEnd v3")
+st.set_page_config(page_title="Avito Master Tool Original Only", layout="wide")
+st.title("Avito Master Tool Original Only")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -25,6 +25,27 @@ avito_file = st.file_uploader("2) Файл Авито", type=["xlsx"])
 stock_file = st.file_uploader("3) Файл остатков", type=["xlsx"])
 
 ARTICLE_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\-]{3,}\b")
+
+# бренды/слова, которые считаем НЕоригиналом
+NON_ORIGINAL_MARKERS = [
+    "superfine",
+    "cactus",
+    "nv-print",
+    "nv print",
+    "sakura",
+    "noname",
+    "no name",
+    "совместим",
+    "аналог",
+    "compatible",
+]
+
+# маркеры оригинала
+ORIGINAL_MARKERS = [
+    "оригинал",
+    "оригинальный",
+    "original",
+]
 
 
 def clean(x):
@@ -93,6 +114,30 @@ def candidate_tokens(text):
     return sorted(uniq, key=lambda s: (-len(s), s))
 
 
+def text_has_non_original_markers(text: str) -> bool:
+    s = clean(text).lower()
+    return any(marker in s for marker in NON_ORIGINAL_MARKERS)
+
+
+def text_has_original_markers(text: str) -> bool:
+    s = clean(text).lower()
+    return any(marker in s for marker in ORIGINAL_MARKERS)
+
+
+def is_original_avito_row(title: str, desc: str) -> bool:
+    full = f"{clean(title)} {clean(desc)}"
+    if text_has_non_original_markers(full):
+        return False
+    return text_has_original_markers(full)
+
+
+def is_original_price_row(row_text: str) -> bool:
+    s = clean(row_text).lower()
+    if text_has_non_original_markers(s):
+        return False
+    return text_has_original_markers(s)
+
+
 def choose_article(title, desc, price_map):
     for source in [desc, title, f"{title} {desc}"]:
         for tok in candidate_tokens(source):
@@ -135,10 +180,19 @@ def load_price_map(file_obj):
 
     price_map = {}
     stock_map = {}
+    skipped_non_original = 0
 
     for _, row in df.iterrows():
-        art = norm_article(row[article_col])
+        article_raw = clean(row[article_col])
+        art = norm_article(article_raw)
         if not art:
+            continue
+
+        full_row_text = " ".join(clean(v) for v in row.tolist())
+
+        # берем только оригинал
+        if not is_original_price_row(full_row_text):
+            skipped_non_original += 1
             continue
 
         price = parse_numeric(row[price_col])
@@ -157,6 +211,8 @@ def load_price_map(file_obj):
         "price_col": price_col,
         "stock_col": stock_col,
         "rows": len(df),
+        "original_positions_loaded": len(price_map),
+        "skipped_non_original_rows": skipped_non_original,
     }
 
 
@@ -233,6 +289,7 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
     dateend_set_from_qty = 0
     dateend_set_from_status = 0
     unmatched = 0
+    skipped_non_original_avito = 0
     examples = []
 
     for ws in wb.worksheets:
@@ -251,24 +308,26 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
             desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
             status_text = ws.cell(row=row, column=status_col).value if status_col else ""
 
-            # пустые строки пропускаем
             if clean(title) == "":
+                continue
+
+            # НЕоригинал в файле Avito не трогаем
+            if not is_original_avito_row(title, desc):
+                skipped_non_original_avito += 1
                 continue
 
             article = choose_article(title, desc, price_map)
 
-            # 1) Если нашли артикул в прайсе — полная логика
+            # если нашли оригинал в прайсе
             if article:
                 qty = int(stock_map.get(article, 0))
 
-                # цена
                 if article in price_map and price_col:
                     base_price = price_map[article]
                     new_price = round_up_100(base_price * (1 + margin_percent / 100.0))
                     ws.cell(row=row, column=price_col).value = new_price
                     updated_prices += 1
 
-                # dateend по количеству
                 new_dateend = calc_dateend_from_qty(
                     qty=qty,
                     offset_hours=offset_hours,
@@ -278,7 +337,6 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
                 ws.cell(row=row, column=dateend_col).value = new_dateend
                 dateend_set_from_qty += 1
 
-                # статус как справка
                 if status_col:
                     ws.cell(row=row, column=status_col).value = "Активно" if qty > 0 else "Снято с публикации"
 
@@ -295,9 +353,10 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
                         "price": ws.cell(row=row, column=price_col).value if price_col else "",
                     })
 
-            # 2) Если артикул не нашли — хотя бы DateEnd по текущему статусу
+            # если прайс не нашёлся — хотя бы DateEnd по текущему статусу
             else:
                 unmatched += 1
+
                 fallback_dateend = calc_dateend_from_status(
                     status_text=status_text,
                     offset_hours=offset_hours,
@@ -329,6 +388,7 @@ def update_prices_and_dateend(avito_file_obj, price_map, stock_map, margin_perce
         "dateend_set_from_qty": dateend_set_from_qty,
         "dateend_set_from_status": dateend_set_from_status,
         "unmatched": unmatched,
+        "skipped_non_original_avito": skipped_non_original_avito,
         "examples": examples,
     }
 
@@ -338,6 +398,7 @@ def build_avito_article_map(avito_file_obj, price_map):
     ad_to_article = {}
     matched = 0
     unmatched = 0
+    skipped_non_original_avito = 0
 
     for ws in wb.worksheets:
         cols = detect_sheet_columns(ws)
@@ -355,6 +416,11 @@ def build_avito_article_map(avito_file_obj, price_map):
 
             title = ws.cell(row=row, column=title_col).value if title_col else ""
             desc = ws.cell(row=row, column=desc_col).value if desc_col else ""
+
+            if not is_original_avito_row(title, desc):
+                skipped_non_original_avito += 1
+                continue
+
             article = choose_article(title, desc, price_map)
 
             if article:
@@ -363,7 +429,11 @@ def build_avito_article_map(avito_file_obj, price_map):
             else:
                 unmatched += 1
 
-    return ad_to_article, {"matched": matched, "unmatched": unmatched}
+    return ad_to_article, {
+        "matched": matched,
+        "unmatched": unmatched,
+        "skipped_non_original_avito": skipped_non_original_avito,
+    }
 
 
 def update_stock_only(stock_file_obj, avito_file_obj, price_map, stock_map):
@@ -490,13 +560,14 @@ if run_prices or run_stock or run_all:
                 "DateEnd по количеству": price_stats["dateend_set_from_qty"],
                 "DateEnd по текущему статусу": price_stats["dateend_set_from_status"],
                 "Не найдено в прайсе": price_stats["unmatched"],
+                "Пропущено неоригинала в файле Avito": price_stats["skipped_non_original_avito"],
             })
             with st.expander("Показать примеры обновления"):
                 st.write(price_stats["examples"])
             st.download_button(
                 "Скачать файл цен + DateEnd",
                 data=price_output.getvalue(),
-                file_name="avito_prices_dateend_updated_v3.xlsx",
+                file_name="avito_prices_dateend_updated_v4.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         except Exception as e:
@@ -527,12 +598,13 @@ if run_prices or run_stock or run_all:
                     "Не сопоставлено по артикулу": stock_stats["unmatched_article_count"],
                     "Совпадений объявлений по артикулу": stock_stats["ad_map_stats"]["matched"],
                     "Не нашли артикул в объявлениях": stock_stats["ad_map_stats"]["unmatched"],
+                    "Пропущено неоригинала в файле Avito": stock_stats["ad_map_stats"]["skipped_non_original_avito"],
                 })
 
                 st.download_button(
                     "Скачать файл остатков",
                     data=stock_output.getvalue(),
-                    file_name="avito_stock_only_updated_v3.xlsx",
+                    file_name="avito_stock_only_updated_v4.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             except Exception as e:
